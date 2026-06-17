@@ -160,12 +160,16 @@ class CommandScheduler:
                 stream_callback=stream_cb,
             )
 
-            if plan.remote_path and plan.mode == "file":
-                script_executor.cleanup.schedule_cleanup(server.id, plan.remote_path)
-                try:
-                    script_executor.cleanup.force_cleanup(server, plan.remote_path)
-                except Exception:
-                    pass
+            all_paths = list(plan.extra_cleanups or [])
+            if plan.remote_path:
+                all_paths.append(plan.remote_path)
+            for p in set(all_paths):
+                script_executor.cleanup.schedule_cleanup(server.id, p)
+            try:
+                for p in set(all_paths):
+                    script_executor.cleanup.force_cleanup(server, p)
+            except Exception:
+                pass
 
             task.exit_code = exit_code
             task.status = "success" if (exit_code is not None and exit_code == 0) else "failed"
@@ -181,13 +185,26 @@ class CommandScheduler:
             task.exit_code = -1
             task.status = "error"
 
-            if plan and plan.remote_path and plan.mode == "file":
-                try:
-                    script_executor.cleanup.schedule_cleanup(server.id, plan.remote_path)
-                    script_executor.cleanup.force_cleanup(server, plan.remote_path)
-                except Exception:
-                    pass
+            if plan:
+                all_paths = list(plan.extra_cleanups or [])
+                if plan.remote_path:
+                    all_paths.append(plan.remote_path)
+                for p in set(all_paths):
+                    try:
+                        script_executor.cleanup.schedule_cleanup(server.id, p)
+                    except Exception:
+                        pass
         finally:
+            try:
+                script_executor.cleanup.schedule_cleanup(
+                    server.id, f"$HOME/.ssh_exec_final_*"
+                )
+                script_executor.cleanup.schedule_cleanup(
+                    server.id, "/tmp/.ssh_exec_final_*"
+                )
+            except Exception:
+                pass
+
             task.end_time = datetime.now()
             self._cleanup_server_task(task.server_id, task.task_id)
             self._log_task(task)
