@@ -253,11 +253,65 @@ class SSHConnectionPool:
         try:
             sftp = conn.client.open_sftp()
             try:
-                with sftp.file(remote_path, "w") as f:
-                    f.write(content)
-                sftp.chmod(remote_path, int(mode, 8))
+                try:
+                    parent = os.path.dirname(remote_path)
+                    if parent and parent != "/":
+                        try:
+                            sftp.stat(parent)
+                        except FileNotFoundError:
+                            try:
+                                sftp.mkdir(parent)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                try:
+                    with sftp.file(remote_path, "w") as f:
+                        f.write(content)
+                except PermissionError:
+                    try:
+                        sftp.remove(remote_path)
+                    except Exception:
+                        pass
+                    with sftp.file(remote_path, "wx") as f:
+                        f.write(content)
+
+                chmod_ok = False
+                try:
+                    sftp.chmod(remote_path, int(mode, 8))
+                    chmod_ok = True
+                except Exception:
+                    pass
+
+                if not chmod_ok:
+                    try:
+                        for alt_mode in ["0700", "0755", "0644", "0600"]:
+                            if alt_mode == mode:
+                                continue
+                            try:
+                                sftp.chmod(remote_path, int(alt_mode, 8))
+                                chmod_ok = True
+                                break
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+
+                if not chmod_ok:
+                    try:
+                        shell = conn.client.invoke_shell()
+                        shell.settimeout(8)
+                        shell.send(f"chmod {mode} {remote_path} 2>/dev/null; chmod +x {remote_path} 2>/dev/null\nexit\n")
+                        time.sleep(0.5)
+                        shell.close()
+                    except Exception:
+                        pass
             finally:
-                sftp.close()
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
         finally:
             self.release(conn)
 

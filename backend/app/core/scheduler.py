@@ -7,9 +7,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Callable, Any, Set
 from dataclasses import dataclass, field
 
-from ..config import settings, ServerConfig
+from ..config import settings, ServerConfig, LOGS_DIR
 from ..models import ExecutionResult, LogEntry
 from .ssh_pool import ssh_pool
+from .script_executor import script_executor
 
 
 @dataclass
@@ -128,12 +129,19 @@ class CommandScheduler:
         timeout: int,
     ) -> None:
         task.status = "running"
-        remote_script_path = f"/tmp/{script_name}_{task.task_id}"
+        plan = None
         try:
-            ssh_pool.upload_content(server, script_content, remote_script_path, "0755")
+            plan = script_executor.plan_execution(
+                server=server,
+                script_content=script_content,
+                script_name=script_name,
+                interpreter=interpreter,
+                args=args,
+                task_id=task.task_id,
+            )
 
-            args_str = " ".join(args)
-            task.command = f"{interpreter} {remote_script_path} {args_str}".strip()
+            task.command = plan.command if len(plan.command) < 400 else plan.command[:400] + "..."
+            mode_hint = f"[exec-mode={plan.mode}] " + " ".join(plan.notes[-2:]) + "\n"
 
             def stream_cb(stream: str, content: str) -> None:
                 if stream == "stdout":
@@ -142,24 +150,43 @@ class CommandScheduler:
                     task.stderr += content
                 self._trigger_output_callbacks(task, stream, content)
 
-            exit_code, stdout, stderr = ssh_pool.execute_command(
+            stream_cb("stderr", mode_hint)
+
+            exit_code, stdout, stderr = script_executor.execute(
                 server=server,
-                command=task.command,
+                plan=plan,
+                script_content=script_content,
                 timeout=timeout,
                 stream_callback=stream_cb,
             )
-            task.exit_code = exit_code
-            task.status = "success" if exit_code == 0 else "failed"
 
-            try:
-                ssh_pool.execute_command(server, f"rm -f {remote_script_path}", timeout=10)
-            except Exception:
-                pass
+            if plan.remote_path and plan.mode == "file":
+                script_executor.cleanup.schedule_cleanup(server.id, plan.remote_path)
+                try:
+                    script_executor.cleanup.force_cleanup(server, plan.remote_path)
+                except Exception:
+                    pass
+
+            task.exit_code = exit_code
+            task.status = "success" if (exit_code is not None and exit_code == 0) else "failed"
+
+            if stdout and not task.stdout.endswith(stdout):
+                task.stdout += stdout
+            if stderr and not task.stderr.endswith(stderr):
+                task.stderr += stderr
+
         except Exception as e:
             task.stderr += f"\n[ERROR] {type(e).__name__}: {str(e)}\n"
             self._trigger_output_callbacks(task, "stderr", f"\n[ERROR] {type(e).__name__}: {str(e)}\n")
             task.exit_code = -1
             task.status = "error"
+
+            if plan and plan.remote_path and plan.mode == "file":
+                try:
+                    script_executor.cleanup.schedule_cleanup(server.id, plan.remote_path)
+                    script_executor.cleanup.force_cleanup(server, plan.remote_path)
+                except Exception:
+                    pass
         finally:
             task.end_time = datetime.now()
             self._cleanup_server_task(task.server_id, task.task_id)
@@ -173,8 +200,6 @@ class CommandScheduler:
 
     def _log_task(self, task: Task) -> None:
         try:
-            log_dir = settings.__class__.__dict__.get("LOGS_DIR")
-            from ..config import LOGS_DIR
             date_str = task.start_time.strftime("%Y-%m-%d")
             log_file = LOGS_DIR / f"{date_str}_{task.server_id}.log"
 
