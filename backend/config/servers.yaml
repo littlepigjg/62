@@ -1,0 +1,31 @@
+servers:
+  - id: server-01
+    name: 生产服务器-01
+    host: 192.168.1.101
+    port: 22
+    username: root
+    password: ""
+    private_key: "~/.ssh/id_rsa"
+    tags:
+      - production
+      - web
+  - id: server-02
+    name: 生产服务器-02
+    host: 192.168.1.102
+    port: 22
+    username: root
+    password: ""
+    private_key: "~/.ssh/id_rsa"
+    tags:
+      - production
+      - database
+  - id: test-01
+    name: 测试服务器-01
+    host: 192.168.1.201
+    port: 22
+    username: deploy
+    password: "test123456"
+    private_key: ""
+    tags:
+      - test
+      - web
