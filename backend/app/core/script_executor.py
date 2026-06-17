@@ -54,12 +54,15 @@ class TempPathSelector:
     def __init__(self, candidate_dirs: Optional[List[str]] = None):
         self.candidate_dirs = candidate_dirs or list(DEFAULT_CANDIDATE_DIRS)
         self._dir_cache: dict = {}
+        self._checking: dict = {}
         self._cache_lock = threading.Lock()
-        self._cache_ttl: int = 300
+        self._cache_ttl: int = 90
+        self._soft_check_enabled: bool = True
 
     def invalidate_server(self, server_id: str) -> None:
         with self._cache_lock:
             self._dir_cache.pop(server_id, None)
+            self._checking.pop(server_id, None)
 
     def _expand(self, server: ServerConfig, path: str) -> str:
         if server.username == "root":
@@ -134,39 +137,140 @@ class TempPathSelector:
         except Exception as e:
             return False, f"exception: {type(e).__name__}: {e}"
 
+    def _soft_verify_dir(
+        self,
+        server: ServerConfig,
+        dir_path: str,
+        required_bytes: int,
+        cached_avail_kb: int,
+    ) -> Tuple[bool, str]:
+        required_kb = max(64, (required_bytes // 1024) + 256)
+        if cached_avail_kb and cached_avail_kb < required_kb:
+            return False, f"cached avail {cached_avail_kb}KB < {required_kb}KB"
+        verify_script = rf"""
+        set +e
+        d={dir_path!r}
+        [ -d "$d" ] || {{ echo "FAIL: not a dir"; exit 2; }}
+        [ -w "$d" ] || {{ echo "FAIL: not writable"; exit 3; }}
+        avail=$(df -Pk "$d" 2>/dev/null | awk 'NR==2 {{print $4}}' || echo 0)
+        avail_num=${{avail:-0}}
+        case "$avail_num" in
+            ''|*[!0-9]*) avail_num=0 ;;
+        esac
+        if [ "$avail_num" -gt 0 ] 2>/dev/null && [ "$avail_num" -lt {required_kb} ] 2>/dev/null; then
+            echo "FAIL: avail=$avail_num KB < {required_kb}"
+            exit 4
+        fi
+        rnd=$(date +%s%N 2>/dev/null || echo $RANDOM)
+        sf="$d/.ssh_exec_sv_$$_$rnd"
+        ( echo "sv" > "$sf" 2>/dev/null && rm -f "$sf" ) || {{ echo "FAIL: write test"; exit 5; }}
+        echo "OK avail=${{avail_num:-unknown}}"
+        exit 0
+        """
+        try:
+            exit_code, stdout, stderr = ssh_pool.execute_command(
+                server, verify_script, timeout=10,
+            )
+            out = (stdout + stderr).strip()
+            if exit_code == 0 and "OK" in out:
+                m = re.search(r"avail=(\d+)", out)
+                avail = int(m.group(1)) if m else 0
+                return True, f"soft-ok avail={avail}KB"
+            return False, out.splitlines()[-1] if out else f"exit {exit_code}"
+        except Exception as e:
+            return False, f"exception: {type(e).__name__[:20]}"
+
     def select(
         self,
         server: ServerConfig,
         script_size: int,
         force_refresh: bool = False,
+        soft_check: Optional[bool] = None,
     ) -> Tuple[Optional[str], List[str]]:
         cache_key = server.id
         now = time.time()
         notes: List[str] = []
+        do_soft = self._soft_check_enabled if soft_check is None else soft_check
 
         if not force_refresh:
+            cached_hit = False
+            cached_dir_val = None
+            cached_size_val = 0
+            cached_avail_val = 0
+            cached_notes_val: list = []
+            cached_age = 0
+            size_mismatch_skip = False
             with self._cache_lock:
                 cached = self._dir_cache.get(cache_key)
                 if cached and (now - cached["ts"]) < self._cache_ttl:
-                    notes.append(f"using cached dir (age={int(now-cached['ts'])}s)")
-                    return cached["dir"], list(cached.get("notes", [])) + notes
+                    cached_size_val = cached.get("size", 0)
+                    cached_avail_val = cached.get("avail_kb", 0)
+                    cached_dir_val = cached["dir"]
+                    cached_notes_val = list(cached.get("notes", []))
+                    cached_age = int(now - cached["ts"])
+                    if script_size > cached_size_val * 1.5 and cached_size_val > 0:
+                        notes.append(
+                            f"cached dir skipped (size mismatch: need={script_size} > 1.5x cached={cached_size_val})"
+                        )
+                        size_mismatch_skip = True
+                    else:
+                        cached_hit = True
+                        self._dir_cache.pop(cache_key, None)
+
+            if cached_hit:
+                if do_soft:
+                    ok, sreason = self._soft_verify_dir(
+                        server, cached_dir_val, script_size, cached_avail_val,
+                    )
+                    if ok:
+                        notes.append(f"cached dir + soft-verified (age={cached_age}s, {sreason})")
+                        with self._cache_lock:
+                            self._dir_cache[cache_key] = {
+                                "ts": now,
+                                "dir": cached_dir_val,
+                                "size": max(script_size, cached_size_val),
+                                "avail_kb": cached_avail_val,
+                                "notes": cached_notes_val + notes,
+                            }
+                        return cached_dir_val, cached_notes_val + notes
+                    else:
+                        notes.append(f"soft-check FAILED for cached dir: {sreason}, rechecking...")
+                        self.invalidate_server(server.id)
+                else:
+                    notes.append(f"using cached dir (age={cached_age}s, no soft-check)")
+                    return cached_dir_val, cached_notes_val + notes
+        elif force_refresh:
+            self.invalidate_server(cache_key)
+
+        with self._cache_lock:
+            other_ts = self._checking.get(cache_key)
+            if other_ts and (now - other_ts) < 15:
+                pass
+            else:
+                self._checking[cache_key] = now
 
         chosen: Optional[str] = None
+        chosen_avail_kb: int = 0
         for raw_dir in self.candidate_dirs:
             dir_path = self._expand(server, raw_dir)
             ok, reason = self._check_dir(server, dir_path, script_size)
             if ok:
                 chosen = dir_path
+                m = re.search(r"avail=(\d+)", reason)
+                chosen_avail_kb = int(m.group(1)) if m else 0
                 notes.append(f"dir chosen: {dir_path} (cand='{raw_dir}', {reason})")
                 break
             else:
                 notes.append(f"skip {dir_path}: {reason}")
 
         with self._cache_lock:
+            self._checking.pop(cache_key, None)
             if chosen:
                 self._dir_cache[cache_key] = {
                     "ts": now,
                     "dir": chosen,
+                    "size": script_size,
+                    "avail_kb": chosen_avail_kb,
                     "notes": notes[-3:],
                 }
             else:

@@ -64,7 +64,16 @@ class TestTempPathSelector(unittest.TestCase):
         self.assertNotIn("test-srv-01", self.selector._dir_cache)
 
     def test_cache_short_ttl(self):
-        self.assertEqual(self.selector._cache_ttl, 300, "TTL should be shortened to 5 minutes")
+        self.assertEqual(self.selector._cache_ttl, 90, "TTL should be 90s for concurrency safety")
+
+    def test_invalidate_clears_both_cache_and_checking(self):
+        self.selector._dir_cache["test-srv-01"] = {"ts": time.time(), "dir": "/tmp"}
+        self.selector._checking["test-srv-01"] = time.time()
+        self.assertIn("test-srv-01", self.selector._dir_cache)
+        self.assertIn("test-srv-01", self.selector._checking)
+        self.selector.invalidate_server("test-srv-01")
+        self.assertNotIn("test-srv-01", self.selector._dir_cache)
+        self.assertNotIn("test-srv-01", self.selector._checking)
 
     @patch("app.core.script_executor.ssh_pool")
     def test_select_success_first_candidate(self, mock_ssh_pool):
@@ -72,18 +81,92 @@ class TestTempPathSelector(unittest.TestCase):
         chosen, notes = self.selector.select(TEST_SERVER, 1024)
         self.assertEqual(chosen, "/home/deploy/.cache/ssh_exec")
         self.assertTrue(any("dir chosen" in n for n in notes))
+        with self.selector._cache_lock:
+            c = self.selector._dir_cache.get("test-srv-01")
+        self.assertIsNotNone(c)
+        self.assertEqual(c["size"], 1024)
+        self.assertEqual(c["avail_kb"], 512000)
+        self.assertEqual(c["dir"], "/home/deploy/.cache/ssh_exec")
 
-    @patch("app.core.script_executor.ssh_pool")
-    def test_select_cache_hit(self, mock_ssh_pool):
+    def test_select_cache_hit_no_soft_check(self):
         self.selector._dir_cache["test-srv-01"] = {
             "ts": time.time(),
             "dir": "/cached/dir",
+            "size": 2048,
+            "avail_kb": 100000,
+            "notes": ["cached from before"],
+        }
+        chosen, notes = self.selector.select(TEST_SERVER, 1024, soft_check=False)
+        self.assertEqual(chosen, "/cached/dir")
+        self.assertTrue(any("no soft-check" in n for n in notes))
+
+    @patch("app.core.script_executor.ssh_pool")
+    def test_select_cache_hit_soft_verify_passes(self, mock_ssh_pool):
+        self.selector._soft_verify_dir = MagicMock(return_value=(True, "soft-ok avail=100000KB"))
+        self.selector._dir_cache["test-srv-01"] = {
+            "ts": time.time(),
+            "dir": "/cached/dir",
+            "size": 2048,
+            "avail_kb": 100000,
             "notes": ["cached from before"],
         }
         chosen, notes = self.selector.select(TEST_SERVER, 1024)
         self.assertEqual(chosen, "/cached/dir")
-        self.assertTrue(any("cached dir" in n for n in notes))
-        mock_ssh_pool.execute_command.assert_not_called()
+        self.assertTrue(any("soft-verified" in n for n in notes))
+        self.selector._soft_verify_dir.assert_called_once()
+
+    @patch("app.core.script_executor.ssh_pool")
+    def test_select_cache_hit_soft_verify_fails_triggers_recheck(self, mock_ssh_pool):
+        self.selector._soft_verify_dir = MagicMock(return_value=(False, "FAIL: write test"))
+        mock_ssh_pool.execute_command.return_value = (0, "STAGE_OK dir=/tmp avail=50000\n", "")
+        self.selector._dir_cache["test-srv-01"] = {
+            "ts": time.time(),
+            "dir": "/cached/dir",
+            "size": 2048,
+            "avail_kb": 100000,
+            "notes": [],
+        }
+        chosen, notes = self.selector.select(TEST_SERVER, 1024)
+        self.assertNotEqual(chosen, "/cached/dir",
+                            "must not return stale cached dir after soft-check failed")
+        self.assertTrue(any("soft-check FAILED" in n for n in notes))
+        self.selector._soft_verify_dir.assert_called_once()
+        mock_ssh_pool.execute_command.assert_called()
+
+    def test_select_size_mismatch_bypasses_cache(self):
+        self.selector._dir_cache["test-srv-01"] = {
+            "ts": time.time(),
+            "dir": "/cached/dir",
+            "size": 1000,
+            "avail_kb": 100000,
+            "notes": [],
+        }
+        with patch("app.core.script_executor.ssh_pool") as mock_ssh_pool:
+            mock_ssh_pool.execute_command.return_value = (0, "STAGE_OK dir=/tmp avail=50000\n", "")
+            chosen, notes = self.selector.select(TEST_SERVER, 2000, soft_check=False)
+        self.assertNotEqual(chosen, "/cached/dir")
+        self.assertTrue(any("size mismatch" in n for n in notes))
+
+    def test_soft_verify_short_circuits_when_cached_avail_too_small(self):
+        ok, reason = self.selector._soft_verify_dir(TEST_SERVER, "/tmp", 1_000_000, 100)
+        self.assertFalse(ok)
+        self.assertIn("cached avail", reason)
+
+    @patch("app.core.script_executor.ssh_pool")
+    def test_soft_verify_calls_df_and_write(self, mock_ssh_pool):
+        mock_ssh_pool.execute_command.return_value = (0, "OK avail=80000", "")
+        ok, reason = self.selector._soft_verify_dir(TEST_SERVER, "/tmp", 1024, 0)
+        self.assertTrue(ok)
+        self.assertIn("avail=80000KB", reason)
+        cmd_sent = mock_ssh_pool.execute_command.call_args[0][1]
+        self.assertIn("df -Pk", cmd_sent)
+        self.assertIn(".ssh_exec_sv_", cmd_sent)
+
+    @patch("app.core.script_executor.ssh_pool")
+    def test_soft_verify_df_insufficient_fails(self, mock_ssh_pool):
+        mock_ssh_pool.execute_command.return_value = (4, "FAIL: avail=100 KB < 500", "")
+        ok, reason = self.selector._soft_verify_dir(TEST_SERVER, "/tmp", 200_000, 0)
+        self.assertFalse(ok)
 
     @patch("app.core.script_executor.ssh_pool")
     def test_select_cache_expired_forces_recheck(self, mock_ssh_pool):
@@ -91,9 +174,11 @@ class TestTempPathSelector(unittest.TestCase):
         self.selector._dir_cache["test-srv-01"] = {
             "ts": time.time() - 99999,
             "dir": "/old/cache",
+            "size": 100,
+            "avail_kb": 100000,
             "notes": [],
         }
-        chosen, notes = self.selector.select(TEST_SERVER, 1024)
+        chosen, notes = self.selector.select(TEST_SERVER, 1024, soft_check=False)
         self.assertNotEqual(chosen, "/old/cache")
         mock_ssh_pool.execute_command.assert_called()
 
@@ -103,11 +188,57 @@ class TestTempPathSelector(unittest.TestCase):
         self.selector._dir_cache["test-srv-01"] = {
             "ts": time.time(),
             "dir": "/cached/dir",
+            "size": 500,
+            "avail_kb": 100000,
             "notes": [],
         }
         chosen, notes = self.selector.select(TEST_SERVER, 1024, force_refresh=True)
         self.assertNotEqual(chosen, "/cached/dir")
         mock_ssh_pool.execute_command.assert_called()
+
+    @patch("app.core.script_executor.ssh_pool")
+    def test_select_sets_checking_flag_during_recheck(self, mock_ssh_pool):
+        observed_checking = {"during_call": False}
+        def slow_check(*args, **kwargs):
+            with self.selector._cache_lock:
+                observed_checking["during_call"] = "test-srv-01" in self.selector._checking
+            return (0, "STAGE_OK dir=/tmp avail=100000\n", "")
+        mock_ssh_pool.execute_command.side_effect = slow_check
+        chosen, _ = self.selector.select(TEST_SERVER, 1024, force_refresh=True)
+        self.assertIsNotNone(chosen)
+        self.assertTrue(observed_checking["during_call"],
+                        "checking flag must be set during recheck phase (thundering-herd guard)")
+        self.assertNotIn("test-srv-01", self.selector._checking)
+
+    @patch("app.core.script_executor.ssh_pool")
+    def test_select_cache_expired_actually_reruns_checks(self, mock_ssh_pool):
+        call_counter = {"n": 0}
+        def counting(*a, **kw):
+            call_counter["n"] += 1
+            return (0, "STAGE_OK dir=/ok avail=99999\n", "")
+        mock_ssh_pool.execute_command.side_effect = counting
+
+        old_ts = time.time() - 99999
+        self.selector._dir_cache["test-srv-01"] = {
+            "ts": old_ts,
+            "dir": "/now/invalid",
+            "size": 100,
+            "avail_kb": 500,
+            "notes": ["old cache"],
+        }
+        chosen, notes = self.selector.select(TEST_SERVER, 1024, soft_check=False)
+        self.assertNotEqual(chosen, "/now/invalid",
+                            "expired cached dir should not be reused (it was removed)")
+        self.assertGreaterEqual(call_counter["n"], 1,
+                                f"should re-execute checks when cache expired, got {call_counter['n']} calls")
+        self.assertIsNotNone(chosen)
+        with self.selector._cache_lock:
+            fresh = self.selector._dir_cache.get("test-srv-01")
+        self.assertIsNotNone(fresh, "a fresh cache entry should be stored after recheck")
+        self.assertGreaterEqual(fresh["ts"], old_ts + 1000,
+                                "fresh cache timestamp must be newer than expired one")
+        self.assertEqual(fresh["size"], 1024,
+                         "fresh cache size must be updated to latest script_size")
 
     @patch("app.core.script_executor.ssh_pool")
     def test_select_all_dirs_fail_returns_none(self, mock_ssh_pool):
